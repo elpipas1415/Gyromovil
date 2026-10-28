@@ -1,0 +1,1286 @@
+package com.gyrowheel
+
+import android.app.Activity
+import android.content.Context
+import android.content.pm.ActivityInfo
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.LinearGradient
+import android.graphics.Path
+import android.graphics.drawable.Drawable
+import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.RippleDrawable
+import android.graphics.Paint
+import android.graphics.RadialGradient
+import android.graphics.RectF
+import android.graphics.Shader
+import android.graphics.Typeface
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
+import android.os.Bundle
+import android.view.Gravity
+import android.view.MotionEvent
+import android.view.Surface
+import android.view.View
+import android.view.WindowManager
+import android.widget.Button
+import android.widget.EditText
+import android.widget.LinearLayout
+import android.widget.TextView
+import android.app.AlertDialog
+import android.net.wifi.WifiManager
+import android.os.Build
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.widget.ScrollView
+import android.widget.SeekBar
+import android.widget.Switch
+import android.graphics.Bitmap
+import android.graphics.BitmapShader
+import android.os.Handler
+import android.os.Looper
+import android.content.res.ColorStateList
+import android.os.SystemClock
+import android.view.ViewGroup
+import android.widget.RadioButton
+import android.widget.RadioGroup
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
+import java.util.Locale
+import kotlin.math.abs
+import kotlin.math.atan2
+import kotlin.math.ceil
+import kotlin.math.cos
+import kotlin.math.sin
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.roundToInt
+
+// Paleta GT3: carbono, grafito, plata y acentos de volante de carreras
+private val CARBON = 0xFF0F1113.toInt()
+private val GRAFITO = 0xFF2B2F35.toInt()
+private val GRAFITO_OSC = 0xFF15181B.toInt()
+private val ALCANTARA = 0xFF3A3F46.toInt()
+private val PLATA = 0xFFC3C8CE.toInt()
+private val PLATA_OSC = 0xFF7D858E.toInt()
+private val BLANCO = 0xFFF2F4F6.toInt()
+private val NARANJA = 0xFFFF7A1A.toInt()
+private val VERDE_GT = 0xFF2BD66A.toInt()
+private val ROJO_GT = 0xFFF0392B.toInt()
+private val AZUL_GT = 0xFF3A8DFF.toInt()
+private val AMARILLO_GT = 0xFFFFC21A.toInt()
+private val APAGADO = 0xFF4A5057.toInt()
+
+/** Ajustes del usuario (se guardan en el celular). */
+object Cfg {
+    var hapMode = 0        // 0 normal, 1 simple, 2 sin vibración
+    var gearHaptic = true  // vibrar al cambiar de marcha (en cualquier modo)
+    var level = 1          // 0 suave, 1 media, 2 fuerte
+    var invert = false
+    var dead = 0.04f       // zona muerta del pedal
+    var smooth = 0.4f      // respuesta de la dirección
+    var drift = false      // modo drift: freno de mano y embrague
+    var telemetry = true   // usar marcha y revoluciones del juego
+    var bumpGain = 150     // fuerza de la vibración por baches y curbs (%)
+    var gripGain = 100     // fuerza de la vibración por agarre perdido (%)
+    var limitGain = 100    // fuerza del aviso antes de perder agarre (%)
+    var clutchInvert = false
+    var knobStyle = 0      // perilla de la palanca: 0 aluminio, 1 carbono, 2 neón, 3 estriada
+    var barStyle = 0       // barras de la palanca: 0 segmentos, 1 continua, 2 ocultas
+    var accent = 0         // color de acento de la palanca (índice de ACENTOS)
+    var knobScale = 100    // tamaño visual de la perilla (%)
+}
+
+private val ACENTOS = intArrayOf(NARANJA, AZUL_GT, VERDE_GT, ROJO_GT, AMARILLO_GT, BLANCO)
+private const val MP = ViewGroup.LayoutParams.MATCH_PARENT
+private const val WC = ViewGroup.LayoutParams.WRAP_CONTENT
+
+class MainActivity : Activity(), SensorEventListener {
+    private lateinit var sm: SensorManager
+    private var dash: DashView? = null
+    private var addr: String? = null
+    @Volatile private var running = false
+    private var raw = 0f
+    private var offset = 0f
+    private var smooth = 0f
+    private var hasReading = false
+    private var range = 180f
+    private var vib: Vibrator? = null
+    private val handler = Handler(Looper.getMainLooper())
+    private var pumping = false
+    @Volatile private var inSettings = false
+    private var holdUntil = 0L
+    @Volatile private var searching = false
+    // FFB del juego: señales suavizadas y control de repetición de los pulsos.
+    private var ffbBump = 0f
+    private var ffbGrip = 0f
+    private var ffbLastBump = 0L
+    private var ffbLastGrip = 0L
+    private var ffbLimit = 0f
+    private var ffbLastLimit = 0L
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        // Orientación bloqueada en horizontal (no gira al mover el celular)
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        sm = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+        @Suppress("DEPRECATION")
+        vib = getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+        loadCfg()
+        showConnect()
+    }
+
+    private fun showConnect() {
+        val prefs = getSharedPreferences("gw", MODE_PRIVATE)
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setBackgroundColor(CARBON)
+            setPadding(80, 30, 80, 30)
+        }
+        val title = TextView(this).apply {
+            text = "Gyromovil"; textSize = 34f; setTextColor(BLANCO); gravity = Gravity.CENTER
+            typeface = sense(context)
+        }
+        val status = TextView(this).apply {
+            typeface = sense(context)
+            setTextColor(NARANJA); gravity = Gravity.CENTER; setPadding(0, 10, 0, 10)
+        }
+        val ip = EditText(this).apply {
+            typeface = sense(context)
+            setText(prefs.getString("ip", ""))
+            hint = "o escribe la IP (192.168.1.20)"
+            setTextColor(BLANCO); setHintTextColor(Color.GRAY); gravity = Gravity.CENTER
+            setSingleLine()
+        }
+        val go = Button(this).apply {
+            typeface = sense(context)
+            text = "Conectar"
+            setOnClickListener {
+                searching = false
+                val a2 = ip.text.toString().trim()
+                if (a2.isNotEmpty()) {
+                    prefs.edit().putString("ip", a2).apply()
+                    addr = a2
+                    startDash()
+                }
+            }
+        }
+        val find = {
+            status.text = "Buscando tu PC…"
+            discover({ found ->
+                prefs.edit().putString("ip", found).apply()
+                addr = found
+                startDash()
+            }, { status.text = "No encontré el PC. Abre el servidor en la PC o escribe la IP." })
+        }
+        val again = Button(this).apply { typeface = sense(context); text = "Buscar de nuevo"; setOnClickListener { find() } }
+        box.addView(title); box.addView(status); box.addView(ip); box.addView(go); box.addView(again)
+        setContentView(box)
+        find()
+    }
+
+    private fun startDash() {
+        val d = DashView(this)
+        d.onCenter = { offset = raw; smooth = 0f }
+        d.rangeDeg = range
+        d.onHaptic = { buzz(it) }
+        d.onPedal = { startPump() }
+        d.onSettings = { showSettings() }
+        dash = d
+        setContentView(d)
+        startSensorsAndSending()
+    }
+
+    private fun startSensorsAndSending() {
+        val d = dash ?: return
+        val target = addr ?: return
+        val s = sm.getDefaultSensor(Sensor.TYPE_GRAVITY) ?: sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        if (s == null) { d.status = "Este celular no tiene sensor de movimiento"; return }
+        sm.registerListener(this, s, SensorManager.SENSOR_DELAY_GAME)
+        running = true
+        resetFfb()
+        handler.removeCallbacks(ffbPump)
+        handler.post(ffbPump)
+        Thread {
+            try {
+                val sock = DatagramSocket()
+                val ipAddr = InetAddress.getByName(target)
+                sock.soTimeout = 500
+                startReceiver(sock, d)
+                d.status = "Enviando a $target"
+                while (running) {
+                    val msg = String.format(
+                        Locale.US, "%.4f,%.3f,%.3f,%d,%d,%d,%d",
+                        if (inSettings) 0f else d.steer, if (inSettings) 0f else d.gas, if (inSettings) 0f else d.brake,
+                        if (!inSettings && d.up) 1 else 0, if (!inSettings && d.down) 1 else 0,
+                        if (!inSettings && d.handbrake) 1 else 0, if ((!inSettings && d.clutch) != Cfg.clutchInvert) 1 else 0
+                    )
+                    val b = msg.toByteArray()
+                    sock.send(DatagramPacket(b, b.size, ipAddr, 5005))
+                    d.postInvalidate()
+                    Thread.sleep(16)
+                }
+                sock.close()
+            } catch (e: Exception) {
+                d.status = "Error: ${e.message}"
+                d.postInvalidate()
+            }
+        }.start()
+    }
+
+    /** Mientras el pedal está activo, vibra cada vez más fuerte cuanto más lo empujas. */
+    private val pump = object : Runnable {
+        override fun run() {
+            val d = dash
+            val g = d?.gas ?: 0f
+            val br = d?.brake ?: 0f
+            val level = max(g, br)
+            if (d != null && level > 0f && Cfg.hapMode == 0) {
+                val braking = br > g
+                if (SystemClock.uptimeMillis() >= holdUntil) gradualBuzz(level, braking)
+                handler.postDelayed(this, if (braking) 100L else 60L)
+            } else {
+                pumping = false
+                vib?.cancel()
+            }
+        }
+    }
+
+    private fun startPump() {
+        if (pumping || Cfg.hapMode != 0) return
+        pumping = true
+        handler.post(pump)
+    }
+
+    /** Acelerar: zumbido continuo. Frenar: pulsos. Los dos crecen con la fuerza del pedal. */
+    private fun gradualBuzz(level: Float, braking: Boolean) {
+        val v = vib ?: return
+        if (!v.hasVibrator()) return
+        val scale = floatArrayOf(0.5f, 0.75f, 1f)[Cfg.level.coerceIn(0, 2)]
+        val amp = (30 + 225 * level * scale).toInt().coerceIn(1, 255)
+        val ms = if (braking) 50L else 70L
+        if (Build.VERSION.SDK_INT >= 26) {
+            // sin control de intensidad en el motor, se simula alargando el pulso
+            val dur = if (v.hasAmplitudeControl()) ms else (ms * (0.3f + 0.7f * level)).toLong().coerceAtLeast(10L)
+            v.vibrate(VibrationEffect.createOneShot(dur, amp))
+        } else {
+            @Suppress("DEPRECATION") v.vibrate(ms)
+        }
+    }
+
+    private fun loadCfg() {
+        val p = getSharedPreferences("gw", MODE_PRIVATE)
+        Cfg.hapMode = p.getInt("mode", 0)
+        Cfg.gearHaptic = p.getBoolean("gearhap", true)
+        Cfg.drift = p.getBoolean("drift", false)
+        Cfg.telemetry = p.getBoolean("tele", true)
+        Cfg.bumpGain = p.getInt("bump2", 150)   // clave nueva: todos parten del nuevo valor agresivo
+        Cfg.gripGain = p.getInt("grip", 100)
+        Cfg.limitGain = p.getInt("limit", 100)
+        Cfg.clutchInvert = p.getBoolean("cinv", false)
+        range = p.getFloat("range", 180f)
+        Cfg.level = p.getInt("lvl", 1)
+        Cfg.invert = p.getBoolean("inv", false)
+        Cfg.dead = p.getFloat("dead", 0.04f)
+        Cfg.smooth = p.getFloat("smo", 0.4f)
+        Cfg.knobStyle = p.getInt("kst", 0)
+        Cfg.barStyle = p.getInt("bst", 0)
+        Cfg.accent = p.getInt("acc", 0)
+        Cfg.knobScale = p.getInt("ksc", 100)
+    }
+
+    private fun saveCfg() {
+        getSharedPreferences("gw", MODE_PRIVATE).edit()
+            .putInt("mode", Cfg.hapMode).putBoolean("gearhap", Cfg.gearHaptic).putBoolean("drift", Cfg.drift).putBoolean("tele", Cfg.telemetry).putInt("bump2", Cfg.bumpGain).putInt("limit", Cfg.limitGain).putInt("grip", Cfg.gripGain).putBoolean("cinv", Cfg.clutchInvert).putFloat("range", range).putInt("lvl", Cfg.level).putBoolean("inv", Cfg.invert)
+            .putInt("kst", Cfg.knobStyle).putInt("bst", Cfg.barStyle).putInt("acc", Cfg.accent).putInt("ksc", Cfg.knobScale)
+            .putFloat("dead", Cfg.dead).putFloat("smo", Cfg.smooth).apply()
+    }
+
+    /**
+     * Modo FFB: vibra según los baches, pianos y el límite de agarre que calcula el PC.
+     *
+     * Los valores llegan a 50 Hz y ya vienen limitados a 0..100. Aquí se suavizan
+     * para que la vibración no "tiemble" y se convierten en pulsos cortos:
+     * los baches son golpes secos y el límite de agarre es un zumbido continuo.
+     */
+    private val ffbPump = object : Runnable {
+        override fun run() {
+            if (!running) return
+            val d = dash
+            val now = SystemClock.uptimeMillis()
+            if (d == null || inSettings || Cfg.hapMode != 3 || !d.ffbOn) {
+                resetFfb()
+                handler.postDelayed(this, 50)
+                return
+            }
+
+            val targetBump = min(1f, d.tBump / 100f * (Cfg.bumpGain / 100f))
+            val targetGrip = min(1f, d.tGrip / 100f * (Cfg.gripGain / 100f))
+            val targetLimit = min(1f, d.tLimit / 100f * (Cfg.limitGain / 100f))
+            // Los golpes entran de inmediato; el resto sube y baja suave para no parpadear.
+            ffbBump += (targetBump - ffbBump) * if (targetBump > ffbBump) 0.90f else 0.25f
+            ffbGrip += (targetGrip - ffbGrip) * if (targetGrip > ffbGrip) 0.35f else 0.12f
+            ffbLimit += (targetLimit - ffbLimit) * if (targetLimit > ffbLimit) 0.40f else 0.20f
+            if (ffbBump < 0.01f) ffbBump = 0f
+            if (ffbGrip < 0.01f) ffbGrip = 0f
+            if (ffbLimit < 0.01f) ffbLimit = 0f
+
+            // Un clic de marcha o de tope de pedal tiene prioridad un instante.
+            if (now < holdUntil) {
+                handler.postDelayed(this, 40)
+                return
+            }
+
+            val k = 0.7f + 0.3f * floatArrayOf(0.5f, 0.75f, 1f)[Cfg.level.coerceIn(0, 2)]
+            // 1) Curbs y baches (prioridad máxima): golpe largo y casi a toda la fuerza.
+            //    Un golpe grande da además un "mazazo" de 110 ms a tope. Repetidos sin
+            //    pausa se sienten como el traqueteo de un piano.
+            if (ffbBump >= 0.05f) {
+                if (ffbBump >= 0.45f && now - ffbLastBump >= 130L) {
+                    ffbLastBump = now
+                    pulse(110L, 255)
+                } else if (now - ffbLastBump >= 30L) {
+                    ffbLastBump = now
+                    pulse(80L, (255 * (0.55f + 0.45f * ffbBump) * k).toInt())
+                }
+                handler.postDelayed(this, 20)
+                return
+            }
+            // 2) Agarre perdido: zumbido continuo (pulsos solapados).
+            if (ffbGrip >= 0.08f) {
+                if (now - ffbLastGrip >= 55L) {
+                    ffbLastGrip = now
+                    pulse(55L, (30 + 150 * ffbGrip * k).toInt())
+                }
+                handler.postDelayed(this, 20)
+                return
+            }
+            // 3) A punto de perder agarre: tics cortos que se aceleran al acercarse al
+            //    límite (190 ms entre tics lejos, 60 ms casi encima). No se confunde con
+            //    el zumbido continuo del agarre perdido ni con los golpes de curb.
+            if (ffbLimit >= 0.08f) {
+                val period = (190f - 130f * ffbLimit).toLong()
+                if (now - ffbLastLimit >= period) {
+                    ffbLastLimit = now
+                    pulse(30L, (90 + 130 * ffbLimit * k).toInt())
+                }
+            }
+            handler.postDelayed(this, 20)
+        }
+    }
+
+    /** Vuelve los filtros del FFB a cero (menús, pausa, cambio de PC o de ajustes). */
+    private fun resetFfb() {
+        ffbBump = 0f
+        ffbGrip = 0f
+        ffbLastBump = 0L
+        ffbLastGrip = 0L
+        ffbLimit = 0f
+        ffbLastLimit = 0L
+    }
+
+    /** Recibe del PC la marcha y las revoluciones del juego ("T,marcha,rpm,rpmMax,km/h"). */
+    private fun startReceiver(sock: DatagramSocket, d: DashView) {
+        Thread {
+            val buf = ByteArray(128)
+            while (running && !sock.isClosed) {
+                try {
+                    val pk = DatagramPacket(buf, buf.size)
+                    sock.receive(pk)
+                    val parts = String(pk.data, 0, pk.length).split(",")
+                    if (parts.size >= 5 && parts[0] == "T") {
+                        d.tGear = parts[1].trim().toInt()
+                        d.tRpm = parts[2].trim().toInt()
+                        d.tMaxRpm = parts[3].trim().toInt()
+                        d.tSpeed = parts[4].trim().toFloat()
+                        if (parts.size >= 11) {
+                            d.tCur = parts[5].trim().toInt()
+                            d.tLast = parts[6].trim().toInt()
+                            d.tBest = parts[7].trim().toInt()
+                            d.tDelta = if (parts[8].trim() == "N") Int.MIN_VALUE else parts[8].trim().toInt()
+                            d.tBump = parts[9].trim().toInt()
+                            d.tGrip = parts[10].trim().toInt()
+                            d.tLimit = if (parts.size >= 12) (parts[11].trim().toIntOrNull() ?: 0) else 0
+                        }
+                        d.tStamp = SystemClock.uptimeMillis()
+                    }
+                } catch (e: java.net.SocketTimeoutException) {
+                } catch (e: Exception) {
+                }
+            }
+        }.start()
+    }
+
+    private fun pulse(ms: Long, amp: Int) {
+        val v = vib ?: return
+        if (!v.hasVibrator()) return
+        val a = amp.coerceIn(1, 255)
+        if (Build.VERSION.SDK_INT >= 26) {
+            val effect = if (v.hasAmplitudeControl()) {
+                VibrationEffect.createOneShot(ms, a)
+            } else {
+                // Sin control de intensidad: se acorta el pulso para que se sienta más suave.
+                val dur = (ms * (0.30f + 0.70f * a / 255f)).toLong().coerceAtLeast(10L)
+                VibrationEffect.createOneShot(dur, 255)
+            }
+            v.vibrate(effect)
+        } else @Suppress("DEPRECATION") v.vibrate(ms)
+    }
+
+    /** kind: 1 = cambio de marcha, 2 = tope del pedal, 3 = paso de acelerador a freno (siempre fuerte) */
+    private fun buzz(kind: Int) {
+        when (kind) {
+            1 -> if (!Cfg.gearHaptic) return
+            2 -> if (Cfg.hapMode != 0) return
+            // El golpe al pasar de acelerar a frenar se mantiene también en modo
+            // FFB: es corto y el FFB se reanuda solo cuando termina.
+            3 -> if (Cfg.hapMode == 2) return
+        }
+        val k = floatArrayOf(0.5f, 0.75f, 1f)[Cfg.level.coerceIn(0, 2)]
+        val ms = when (kind) { 1 -> 25L; 2 -> 40L; else -> 130L }
+        holdUntil = SystemClock.uptimeMillis() + ms + 40L   // que el zumbido gradual no lo tape
+        when (kind) {
+            1 -> pulse(ms, (60 + 195 * k).toInt())
+            2 -> pulse(ms, (80 + 175 * k).toInt())
+            else -> pulse(ms, 255)
+        }
+    }
+
+    private fun testBuzz() {
+        val k = floatArrayOf(0.5f, 0.75f, 1f)[Cfg.level.coerceIn(0, 2)]
+        listOf(0L to 0.2f, 300L to 0.55f, 600L to 1f).forEach { (t, lv) ->
+            handler.postDelayed({ pulse(70, (30 + 225 * lv * k).toInt()) }, t)
+        }
+        handler.postDelayed({ pulse(130, 255) }, 1000L)
+    }
+
+    // ---- pantalla de ajustes ----
+    private fun tint(c: Int) = ColorStateList.valueOf(c)
+
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).roundToInt()
+
+    private fun rounded(fill: Int, stroke: Int, r: Int) = GradientDrawable().apply {
+        setColor(fill); cornerRadius = dp(r).toFloat(); setStroke(dp(1), stroke)
+    }
+
+    /** Fondo con onda al tocar, para botones y opciones. */
+    private fun pressable(d: Drawable): Drawable = RippleDrawable(tint(0x33FFFFFF), d, null)
+
+    private fun lp(w: Int, h: Int, top: Int = 0) = LinearLayout.LayoutParams(w, h).apply { topMargin = dp(top) }
+
+    private fun hdr(t: String) = TextView(this).apply {
+        text = t; textSize = 26f; setTextColor(NARANJA); setPadding(dp(4), dp(4), 0, dp(12))
+        typeface = sense(context); letterSpacing = 0.05f
+    }
+
+    private fun txt(t: String) = TextView(this).apply {
+        text = t; textSize = 15f; setTextColor(PLATA); setPadding(0, dp(10), 0, dp(2)); typeface = sense(context)
+    }
+
+    /** Agrupa opciones relacionadas en una tarjeta. */
+    private fun card(vararg v: View) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        background = rounded(GRAFITO_OSC, GRAFITO, 14)
+        setPadding(dp(16), dp(8), dp(16), dp(14))
+        v.forEach { addView(it) }
+        layoutParams = lp(MP, WC).apply { bottomMargin = dp(12) }
+    }
+
+    private fun toggleRow(t: String, on: Boolean, f: (Boolean) -> Unit) = Switch(this).apply {
+        typeface = sense(context); text = t; textSize = 15f; isChecked = on; setTextColor(BLANCO)
+        val chk = arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf())
+        thumbTintList = ColorStateList(chk, intArrayOf(NARANJA, PLATA_OSC))
+        trackTintList = ColorStateList(chk, intArrayOf(0x66FF7A1A, ALCANTARA))
+        setPadding(0, dp(12), 0, dp(8))
+        setOnCheckedChangeListener { _, v -> f(v) }
+    }
+
+    private fun slider(label: String, min: Int, max: Int, cur: Int, fmt: (Int) -> String, f: (Int) -> Unit): LinearLayout {
+        val value = TextView(this).apply { textSize = 16f; setTextColor(NARANJA); setPadding(0, dp(10), 0, 0) }
+        fun show(x: Int) {
+            val s = fmt(x)
+            value.text = s
+            // los números van en monoespaciada; el texto, en Sense
+            value.typeface = if (s.any { it.isDigit() }) Typeface.create(Typeface.MONOSPACE, Typeface.BOLD) else sense(this)
+        }
+        show(cur)
+        val head = LinearLayout(this).apply {
+            addView(txt(label), lp(0, WC).apply { weight = 1f })
+            addView(value)
+        }
+        val s = SeekBar(this).apply {
+            this.max = max - min
+            progress = cur - min
+            progressTintList = tint(NARANJA)
+            thumbTintList = tint(NARANJA)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: SeekBar?, p: Int, user: Boolean) {
+                    show(p + min)
+                    f(p + min)
+                }
+                override fun onStartTrackingTouch(sb: SeekBar?) {}
+                override fun onStopTrackingTouch(sb: SeekBar?) {}
+            })
+        }
+        return LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; addView(head); addView(s) }
+    }
+
+    /** Opciones excluyentes como botones; row = true las pone en fila (para nombres cortos). */
+    private fun choice(options: List<String>, cur: Int, row: Boolean = false, f: (Int) -> Unit): LinearLayout {
+        val box = LinearLayout(this).apply { orientation = if (row) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL }
+        val items = ArrayList<TextView>()
+        fun paint(sel: Int) = items.forEachIndexed { i, tv ->
+            tv.background = pressable(rounded(if (i == sel) 0x33FF7A1A else 0xFF1B1F23.toInt(), if (i == sel) NARANJA else GRAFITO, 10))
+            tv.setTextColor(if (i == sel) BLANCO else PLATA)
+        }
+        options.forEachIndexed { i, o ->
+            val tv = TextView(this).apply {
+                text = o; textSize = 15f; typeface = sense(context)
+                if (row) gravity = Gravity.CENTER
+                setPadding(dp(14), dp(12), dp(14), dp(12))
+                setOnClickListener { paint(i); f(i) }
+            }
+            items.add(tv)
+            box.addView(tv, if (row) lp(0, WC, 6).apply { weight = 1f; marginEnd = dp(6) } else lp(MP, WC, 6))
+        }
+        paint(cur)
+        return box
+    }
+
+    /** Círculos de color para elegir el acento de la palanca. */
+    private fun swatches(cur: Int, f: (Int) -> Unit): LinearLayout {
+        val rowL = LinearLayout(this)
+        val dots = ArrayList<View>()
+        fun paint(sel: Int) = dots.forEachIndexed { i, d ->
+            d.background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(ACENTOS[i])
+                setStroke(dp(if (i == sel) 3 else 1), if (i == sel) BLANCO else GRAFITO)
+            }
+        }
+        ACENTOS.indices.forEach { i ->
+            val d = View(this).apply { setOnClickListener { paint(i); f(i) } }
+            dots.add(d)
+            rowL.addView(d, lp(dp(36), dp(36), 8).apply { marginEnd = dp(10) })
+        }
+        paint(cur)
+        return rowL
+    }
+
+    private fun action(t: String, f: () -> Unit) = Button(this).apply {
+        typeface = sense(context); text = t; setAllCaps(false); textSize = 15f; setTextColor(BLANCO)
+        background = pressable(rounded(GRAFITO, PLATA_OSC, 12))
+        setOnClickListener { f() }
+        layoutParams = lp(MP, WC, 8)
+    }
+
+    private fun page(i: Int, d: DashView, refresh: () -> Unit): View {
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(14), dp(24), dp(24)) }
+        fun add(vararg v: View) = v.forEach { col.addView(it) }
+        when (i) {
+            0 -> add(
+                hdr("Vibración"),
+                card(
+                    txt("Modo"),
+                    choice(listOf("Normal: sigue la fuerza de los pedales", "Simple: solo marcha y cambio de acelerador a freno", "Sin vibración", "FFB del juego: baches, curbs y límite de agarre"), Cfg.hapMode) { Cfg.hapMode = it },
+                    toggleRow("Vibrar al cambiar de marcha", Cfg.gearHaptic) { Cfg.gearHaptic = it }
+                ),
+                card(
+                    slider("Intensidad", 0, 2, Cfg.level, { listOf("Suave", "Media", "Fuerte")[it] }) { Cfg.level = it },
+                    slider("Baches y curbs (modo FFB)", 0, 300, Cfg.bumpGain, { "$it %" }) { Cfg.bumpGain = it },
+                    slider("Límite de agarre (modo FFB)", 0, 200, Cfg.gripGain, { "$it %" }) { Cfg.gripGain = it },
+                    slider("Aviso antes de perder agarre (modo FFB)", 0, 200, Cfg.limitGain, { "$it %" }) { Cfg.limitGain = it }
+                ),
+                action("Probar vibración") { testBuzz() }
+            )
+            1 -> add(
+                hdr("Dirección"),
+                card(
+                    slider("Giro total", 90, 540, range.roundToInt().coerceIn(90, 540), { "$it°" }) { range = it.toFloat(); d.rangeDeg = range },
+                    slider("Respuesta", 1, 9, (Cfg.smooth * 10f).roundToInt().coerceIn(1, 9), { "${it * 10} %" }) { Cfg.smooth = it / 10f },
+                    toggleRow("Invertir dirección", Cfg.invert) { Cfg.invert = it }
+                ),
+                action("Centrar volante") { offset = raw; smooth = 0f }
+            )
+            2 -> {
+                val prev = PedalPreview(this)
+                val opts = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    addView(card(slider("Zona muerta", 0, 15, (Cfg.dead * 100f).roundToInt().coerceIn(0, 15), { "$it %" }) { Cfg.dead = it / 100f }))
+                    addView(card(
+                        txt("Estilo de perilla"),
+                        choice(listOf("Aluminio", "Carbono", "Neón", "Estriada"), Cfg.knobStyle, true) { Cfg.knobStyle = it; prev.invalidate() },
+                        txt("Barras"),
+                        choice(listOf("Segmentos", "Continua", "Ocultas"), Cfg.barStyle, true) { Cfg.barStyle = it; prev.invalidate() },
+                        txt("Color de acento"),
+                        swatches(Cfg.accent) { Cfg.accent = it; prev.invalidate() },
+                        slider("Tamaño de perilla", 70, 130, Cfg.knobScale, { "$it %" }) { Cfg.knobScale = it; prev.invalidate() }
+                    ))
+                }
+                val rowL = LinearLayout(this).apply {
+                    addView(opts, lp(0, WC).apply { weight = 1f })
+                    addView(prev, lp(dp(110), dp(240), 4).apply { marginStart = dp(12) })
+                }
+                add(hdr("Pedales"), rowL)
+            }
+            3 -> add(
+                hdr("Modo de juego"),
+                card(
+                    choice(listOf("Carrera: marchas y pedales", "Drift: agrega freno de mano y embrague"), if (Cfg.drift) 1 else 0) { Cfg.drift = it == 1 },
+                    toggleRow("Invertir embrague (si en el juego va al revés)", Cfg.clutchInvert) { Cfg.clutchInvert = it }
+                )
+            )
+            else -> add(
+                hdr("Conexión"),
+                card(
+                    txt("PC actual: ${addr ?: "sin conectar"}"),
+                    txt(if (d.telemetryOn) "Datos del juego: conectados" else "Datos del juego: sin señal (abre Assetto Corsa y entra a pista)"),
+                    toggleRow("Usar datos del juego (marcha y luces)", Cfg.telemetry) { Cfg.telemetry = it }
+                ),
+                action("Buscar otro PC") { changePc() },
+                action("Restablecer todos los ajustes") { resetCfg(); refresh() }
+            )
+        }
+        return col
+    }
+
+    private fun showSettings() {
+        val d = dash ?: return
+        inSettings = true
+        // Sin telemetría vibrando detrás del menú.
+        resetFfb()
+        handler.removeCallbacks(ffbPump)
+        vib?.cancel()
+        val root = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setBackgroundColor(CARBON) }
+        val tabs = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; setBackgroundColor(0xFF0B0C0E.toInt()); setPadding(dp(14), dp(14), dp(14), dp(14))
+        }
+        val content = ScrollView(this)
+        val tabViews = ArrayList<TextView>()
+        var current = 0
+        fun mark(sel: Int) = tabViews.forEachIndexed { k, tv ->
+            tv.background = pressable(rounded(if (k == sel) 0x33FF7A1A else 0xFF15181B.toInt(), if (k == sel) NARANJA else GRAFITO, 12))
+            tv.setTextColor(if (k == sel) BLANCO else PLATA)
+        }
+        fun show(i: Int) {
+            current = i
+            mark(i)
+            content.removeAllViews()
+            content.addView(page(i, d) { show(current) })
+        }
+        tabs.addView(TextView(this).apply {
+            text = "Ajustes"; textSize = 26f; setTextColor(BLANCO); typeface = sense(context)
+            letterSpacing = 0.05f; setPadding(dp(6), dp(2), 0, dp(10))
+        })
+        listOf("Vibración", "Dirección", "Pedales", "Modo", "Conexión").forEachIndexed { i, n ->
+            val tv = TextView(this).apply {
+                text = n; textSize = 17f; typeface = sense(context)
+                setPadding(dp(16), dp(14), dp(12), dp(14)); setOnClickListener { show(i) }
+            }
+            tabViews.add(tv)
+            tabs.addView(tv, lp(MP, WC, 6))
+        }
+        tabs.addView(action("← Volver") { closeSettings() }, lp(MP, WC, 18))
+        root.addView(ScrollView(this).apply { addView(tabs) }, LinearLayout.LayoutParams(0, MP, 0.28f))
+        root.addView(content, LinearLayout.LayoutParams(0, MP, 0.72f))
+        setContentView(root)
+        show(0)
+    }
+
+    private fun closeSettings() {
+        inSettings = false
+        saveCfg()
+        resetFfb()
+        dash?.let { setContentView(it) }
+        if (running) {
+            handler.removeCallbacks(ffbPump)
+            handler.post(ffbPump)
+        }
+    }
+
+    private fun changePc() {
+        inSettings = false
+        running = false
+        sm.unregisterListener(this)
+        handler.removeCallbacks(pump)
+        handler.removeCallbacks(ffbPump)
+        resetFfb()
+        pumping = false
+        vib?.cancel()
+        dash = null
+        showConnect()
+    }
+
+    private fun resetCfg() {
+        Cfg.hapMode = 0; Cfg.gearHaptic = true; Cfg.level = 1; Cfg.invert = false
+        Cfg.dead = 0.04f; Cfg.smooth = 0.4f; Cfg.drift = false; Cfg.telemetry = true
+        Cfg.bumpGain = 150; Cfg.gripGain = 100; Cfg.limitGain = 100; Cfg.clutchInvert = false
+        Cfg.knobStyle = 0; Cfg.barStyle = 0; Cfg.accent = 0; Cfg.knobScale = 100
+        range = 180f
+        dash?.rangeDeg = range
+        saveCfg()
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onBackPressed() {
+        if (inSettings) closeSettings() else super.onBackPressed()
+    }
+
+    /** Busca el servidor del PC mandando un aviso a toda la red WiFi. */
+    private fun discover(onFound: (String) -> Unit, onFail: () -> Unit) {
+        searching = true
+        Thread {
+            var found: String? = null
+            try {
+                val sock = DatagramSocket()
+                sock.broadcast = true
+                sock.soTimeout = 700
+                val msg = "GYRO?".toByteArray()
+                val targets = mutableListOf("255.255.255.255")
+                subnetBroadcast()?.let { targets.add(it) }
+                val buf = ByteArray(32)
+                var tries = 0
+                while (searching && found == null && tries < 5) {
+                    tries++
+                    for (t in targets) {
+                        try {
+                            sock.send(DatagramPacket(msg, msg.size, InetAddress.getByName(t), 5005))
+                        } catch (e: Exception) { }
+                    }
+                    try {
+                        val reply = DatagramPacket(buf, buf.size)
+                        sock.receive(reply)
+                        if (String(reply.data, 0, reply.length) == "GYRO!") found = reply.address.hostAddress
+                    } catch (e: java.net.SocketTimeoutException) { }
+                }
+                sock.close()
+            } catch (e: Exception) { }
+            val result = found
+            runOnUiThread {
+                if (searching) {
+                    searching = false
+                    if (result != null) onFound(result) else onFail()
+                }
+            }
+        }.start()
+    }
+
+    @Suppress("DEPRECATION")
+    private fun subnetBroadcast(): String? {
+        val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager ?: return null
+        val d = wm.dhcpInfo ?: return null
+        if (d.ipAddress == 0) return null
+        val b = (d.ipAddress and d.netmask) or d.netmask.inv()
+        return "${b and 255}.${(b shr 8) and 255}.${(b shr 16) and 255}.${(b shr 24) and 255}"
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (dash != null && !running) startSensorsAndSending()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        running = false
+        handler.removeCallbacks(pump)
+        handler.removeCallbacks(ffbPump)
+        pumping = false
+        resetFfb()
+        vib?.cancel()
+        saveCfg()
+        sm.unregisterListener(this)
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onSensorChanged(e: SensorEvent) {
+        val x = e.values[0]
+        val y = e.values[1]
+        val right: Float
+        val up: Float
+        when (windowManager.defaultDisplay.rotation) {
+            Surface.ROTATION_90 -> { right = -y; up = x }
+            Surface.ROTATION_270 -> { right = y; up = -x }
+            Surface.ROTATION_180 -> { right = -x; up = -y }
+            else -> { right = x; up = y }
+        }
+        raw = Math.toDegrees(atan2(-right, up).toDouble()).toFloat()
+        if (!hasReading) { hasReading = true; offset = raw }
+        var delta = raw - offset
+        while (delta > 180) delta -= 360
+        while (delta < -180) delta += 360
+        if (Cfg.invert) delta = -delta
+        smooth += (delta - smooth) * Cfg.smooth
+        dash?.steer = (smooth / (range / 2f)).coerceIn(-1f, 1f)
+    }
+
+    override fun onAccuracyChanged(s: Sensor?, a: Int) {}
+}
+
+private var senseTf: Typeface? = null
+/** Fuente de las letras (assets/fonts/sensefont.ttf); los números del HUD siguen en monoespaciada. */
+private fun sense(c: Context): Typeface = senseTf ?: Typeface.createFromAsset(c.assets, "fonts/sensefont.ttf").also { senseTf = it }
+
+/** Barras de la palanca: verde sube (acelerador), rojo baja (freno), alrededor de la línea central cy. */
+private fun drawBars(c: Canvas, p: Paint, t: RectF, cx: Float, cy: Float, half: Float, bw: Float, gas: Float, brake: Float) {
+    if (Cfg.barStyle == 2) return
+    p.style = Paint.Style.FILL
+    val off = 0xFF1B1F23.toInt()
+    if (Cfg.barStyle == 1) {
+        t.set(cx - bw / 2f, cy - half, cx + bw / 2f, cy + half)
+        p.color = off
+        c.drawRoundRect(t, 8f, 8f, p)
+        if (gas > 0f) { t.set(cx - bw / 2f, cy - gas * half, cx + bw / 2f, cy); p.color = VERDE_GT; c.drawRoundRect(t, 8f, 8f, p) }
+        if (brake > 0f) { t.set(cx - bw / 2f, cy, cx + bw / 2f, cy + brake * half); p.color = ROJO_GT; c.drawRoundRect(t, 8f, 8f, p) }
+        return
+    }
+    val n = 10
+    val step = half / n
+    val gap = 5f
+    for (i in 0 until n) {
+        t.set(cx - bw / 2f, cy - (i + 1) * step + gap / 2f, cx + bw / 2f, cy - i * step - gap / 2f)
+        p.color = if (gas * n > i) VERDE_GT else off
+        c.drawRoundRect(t, 6f, 6f, p)
+        t.set(cx - bw / 2f, cy + i * step + gap / 2f, cx + bw / 2f, cy + (i + 1) * step - gap / 2f)
+        p.color = if (brake * n > i) ROJO_GT else off
+        c.drawRoundRect(t, 6f, 6f, p)
+    }
+}
+
+/** Perilla de la palanca según Cfg.knobStyle, con la línea central en el color de acento. */
+private fun drawKnob(c: Canvas, p: Paint, t: RectF, cx: Float, ky: Float, kw: Float, kh: Float) {
+    val acc = ACENTOS[Cfg.accent.coerceIn(0, ACENTOS.size - 1)]
+    t.set(cx - kw / 2f, ky - kh / 2f, cx + kw / 2f, ky + kh / 2f)
+    p.style = Paint.Style.FILL
+    when (Cfg.knobStyle) {
+        1 -> {   // carbono
+            p.color = PLATA_OSC; c.drawRoundRect(t, 12f, 12f, p)
+            t.inset(4f, 4f)
+            p.color = 0xFF16181B.toInt(); c.drawRoundRect(t, 9f, 9f, p)
+        }
+        2 -> {   // neón: halo suave y borde de color
+            p.color = 0xFF0A0B0D.toInt(); c.drawRoundRect(t, 12f, 12f, p)
+            p.style = Paint.Style.STROKE
+            p.color = acc; p.alpha = 70; p.strokeWidth = 14f; c.drawRoundRect(t, 12f, 12f, p)
+            p.color = acc; p.strokeWidth = 4f; c.drawRoundRect(t, 12f, 12f, p)
+        }
+        else -> {   // aluminio (y estriada)
+            p.color = PLATA_OSC; c.drawRoundRect(t, 12f, 12f, p)
+            t.inset(4f, 4f)
+            p.color = PLATA; c.drawRoundRect(t, 9f, 9f, p)
+        }
+    }
+    if (Cfg.knobStyle == 3) {
+        p.style = Paint.Style.STROKE; p.strokeWidth = 2f; p.color = PLATA_OSC
+        for (k in intArrayOf(-2, -1, 1, 2)) {
+            val y = ky + k * kh * 0.17f
+            c.drawLine(cx - kw / 2f + 14f, y, cx + kw / 2f - 14f, y, p)
+        }
+    }
+    p.style = Paint.Style.STROKE
+    p.strokeCap = Paint.Cap.BUTT
+    p.strokeWidth = 5f
+    p.color = acc
+    c.drawLine(cx - kw / 2f + 14f, ky, cx + kw / 2f - 14f, ky, p)
+}
+
+/** Vista previa de la palanca dentro de Ajustes → Pedales; se repinta al cambiar un estilo. */
+class PedalPreview(ctx: Context) : View(ctx) {
+    private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val t = RectF()
+    override fun onDraw(c: Canvas) {
+        val w = width.toFloat(); val h = height.toFloat()
+        t.set(2f, 2f, w - 2f, h - 2f)
+        p.style = Paint.Style.FILL; p.color = 0xFF0A0B0D.toInt()
+        c.drawRoundRect(t, 22f, 22f, p)
+        p.style = Paint.Style.STROKE; p.strokeWidth = 4f; p.color = PLATA_OSC
+        c.drawRoundRect(t, 22f, 22f, p)
+        val half = h * 0.36f
+        drawBars(c, p, t, w / 2f, h / 2f, half, w * 0.34f, 0.6f, 0f)
+        val sc = Cfg.knobScale / 100f
+        drawKnob(c, p, t, w / 2f, h / 2f - 0.6f * half, min(w * 0.8f * sc, w * 0.94f), h * 0.085f * sc)
+    }
+}
+
+class DashView(ctx: Context) : View(ctx) {
+    @Volatile var steer = 0f
+    /** Palanca única: -1 (freno a fondo) ... 0 (reposo) ... +1 (acelerador a fondo) */
+    @Volatile var pedal = 0f
+    @Volatile var up = false
+    @Volatile var down = false
+    @Volatile var rangeDeg = 180f
+    @Volatile var status = ""
+    var onCenter: () -> Unit = {}
+    var onSettings: () -> Unit = {}
+    var onHaptic: (Int) -> Unit = {}
+    var onPedal: () -> Unit = {}
+    @Volatile var handbrake = false
+    @Volatile var clutch = false
+    @Volatile var tGear = 1
+    @Volatile var tRpm = 0
+    @Volatile var tMaxRpm = 0
+    @Volatile var tSpeed = 0f
+    @Volatile var tStamp = 0L
+    @Volatile var tCur = -1
+    @Volatile var tLast = -1
+    @Volatile var tBest = -1
+    @Volatile var tDelta = Int.MIN_VALUE
+    @Volatile var tBump = 0
+    @Volatile var tGrip = 0
+    @Volatile var tLimit = 0
+    val telemetryOn: Boolean get() = Cfg.telemetry && tMaxRpm > 0 && SystemClock.uptimeMillis() - tStamp < 1500
+    /** Para el FFB: si el juego deja de mandar datos (pausa, menú, boxes) se corta en seguida. */
+    val ffbOn: Boolean get() = telemetryOn && SystemClock.uptimeMillis() - tStamp < 400
+
+    val gas: Float get() = deadzone(pedal)
+    val brake: Float get() = deadzone(-pedal)
+    private fun deadzone(x: Float) = if (x < Cfg.dead) 0f else (x - Cfg.dead) / (1f - Cfg.dead)
+
+    private val pedalR = RectF(); private val upR = RectF(); private val downR = RectF()
+    private val calR = RectF(); private val settingsR = RectF()
+    private val ledR = RectF(); private val tmp = RectF()
+    private val handR = RectF(); private val clutchR = RectF()
+    private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val bgPaint = Paint()
+    private val fontMono = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+    private val fontCond = sense(ctx)
+    private var cTop = 0f; private var cH = 1f; private var cCx = 0f; private var cW = 1f
+    private var trackCy = 0f; private var halfLen = 1f; private var knobH = 60f
+    private var pedalId = -1
+    private var lastStep = 0
+    private var lastSide = 0
+    private var driftCaptionY = 0f
+    private var gearCaptionX = 0f; private var gearCaptionY = 0f
+
+    init {
+        // Fondo de fibra de carbono: un cuadrito que se repite
+        val t = 20
+        val bmp = Bitmap.createBitmap(t, t, Bitmap.Config.ARGB_8888)
+        val cv = Canvas(bmp)
+        val q = Paint()
+        cv.drawColor(0xFF111316.toInt())
+        q.color = 0xFF1A1D21.toInt()
+        cv.drawRect(0f, 0f, t / 2f, t / 2f, q)
+        cv.drawRect(t / 2f, t / 2f, t.toFloat(), t.toFloat(), q)
+        q.color = 0xFF0C0D0F.toInt()
+        cv.drawRect(t / 2f, 0f, t.toFloat(), t / 2f, q)
+        bgPaint.shader = BitmapShader(bmp, Shader.TileMode.REPEAT, Shader.TileMode.REPEAT)
+    }
+
+    private var laidDrift = false
+    private val gearPath = Path()
+    private var gearShader: Shader? = null
+    private var settingsBg: Shader? = null
+
+    override fun onSizeChanged(w: Int, h: Int, ow: Int, oh: Int) = layout(w, h)
+
+    private fun layout(w: Int, h: Int) {
+        laidDrift = Cfg.drift
+        val m = 20f
+        val sideW = w * 0.2f
+        val gap = 14f
+        // Derecha: palanca única
+        pedalR.set(w - m - sideW, m, w - m, h - m)
+        val hh = pedalR.height()
+        knobH = hh * 0.085f
+        trackCy = pedalR.centerY()
+        halfLen = hh * 0.5f - hh * 0.22f - knobH / 2f
+        // Izquierda: giro y marchas apiladas (+ arriba, − abajo); en drift se reserva abajo freno de mano y embrague
+        val cbh = h * 0.13f
+        settingsR.set(m, m, m + sideW, m + cbh)   // engranaje arriba a la izquierda
+        buildGear(settingsR.centerX(), settingsR.centerY(), settingsR.height() * 0.38f)
+        settingsBg = LinearGradient(0f, settingsR.top, 0f, settingsR.bottom, GRAFITO, GRAFITO_OSC, Shader.TileMode.CLAMP)
+        val gb = (sideW - gap) / 2f
+        gearCaptionX = m + sideW / 2f
+        gearCaptionY = m + cbh + gap + 24f
+        val gTop = gearCaptionY + 10f
+        val bottom = h - m
+        var gEnd = bottom
+        if (Cfg.drift) {
+            handR.set(m, bottom - gb, m + gb, bottom)
+            clutchR.set(m + gb + gap, bottom - gb, m + sideW, bottom)
+            driftCaptionY = bottom - gb - 12f
+            gEnd = bottom - gb - 44f
+        }
+        val gh = (gEnd - gTop - gap) / 2f
+        upR.set(m, gTop, m + sideW, gTop + gh)
+        downR.set(m, gTop + gh + gap, m + sideW, gEnd)
+        // Centro: tira de luces, volante y botón de centrar
+        val cl = m + sideW + gap
+        val cr = pedalR.left - gap
+        val cbw = w * 0.2f
+        ledR.set(cl, m, cr, m + h * 0.07f)
+        calR.set(w / 2f - cbw / 2f, h - m - gap - cbh, w / 2f + cbw / 2f, h - m - gap)
+        val availH = calR.top - ledR.bottom
+        cTop = ledR.bottom + 10f
+        cH = availH - 30f
+        cCx = (cl + cr) / 2f
+        cW = cr - cl
+    }
+
+    override fun onDraw(c: Canvas) {
+        if (laidDrift != Cfg.drift) layout(width, height)
+        c.drawPaint(bgPaint)
+        drawLeds(c)
+        drawPedalPanel(c)
+        drawCenter(c)
+
+        p.style = Paint.Style.FILL
+        p.typeface = fontCond
+        p.color = PLATA_OSC
+        p.textAlign = Paint.Align.CENTER
+        p.textSize = 26f
+        c.drawText("MARCHA", gearCaptionX, gearCaptionY, p)
+        button(c, downR, "−", down, downR.height() * 0.4f, AZUL_GT)
+        button(c, upR, "+", up, downR.height() * 0.4f, NARANJA)
+        if (Cfg.drift) {
+            p.style = Paint.Style.FILL
+            p.typeface = fontCond
+            p.color = PLATA_OSC
+            p.textAlign = Paint.Align.CENTER
+            p.textSize = 26f
+            c.drawText("DRIFT", gearCaptionX, driftCaptionY, p)
+            button(c, handR, "Freno mano", handbrake, 34f, ROJO_GT)
+            button(c, clutchR, "Embrague", clutch, 34f, AMARILLO_GT)
+        }
+        button(c, calR, "Centrar", false, min(calR.height() * 0.42f, 34f), PLATA_OSC)
+        drawSettingsButton(c)
+
+        p.typeface = fontMono
+        p.color = APAGADO
+        p.textSize = 22f
+        c.drawText(status + (if (telemetryOn) " · juego conectado" else "") + (if (telemetryOn && Cfg.hapMode == 3) "  baches ${tBump}% agarre ${tGrip}% límite ${tLimit}%" else ""), width / 2f, height - 4f, p)
+    }
+
+    /** Engranaje de 10 dientes con agujero; se arma una vez por tamaño de pantalla. */
+    private fun buildGear(cx: Float, cy: Float, r: Float) {
+        val n = 10
+        val step = Math.toRadians(360.0 / n)
+        val root = r * 0.78f
+        gearPath.reset()
+        gearPath.fillType = Path.FillType.EVEN_ODD
+        for (i in 0 until n) {
+            val a = step * i
+            // cada diente: base ancha sobre el cuerpo y punta más angosta
+            val pts = listOf(a - step * 0.30 to root, a - step * 0.16 to r, a + step * 0.16 to r, a + step * 0.30 to root)
+            pts.forEachIndexed { k, (ang, rad) ->
+                val x = (cx + rad * cos(ang)).toFloat()
+                val y = (cy + rad * sin(ang)).toFloat()
+                if (i == 0 && k == 0) gearPath.moveTo(x, y) else gearPath.lineTo(x, y)
+            }
+        }
+        gearPath.close()
+        gearPath.addCircle(cx, cy, r * 0.30f, Path.Direction.CW)
+        gearShader = RadialGradient(cx - r * 0.35f, cy - r * 0.35f, r * 1.7f, PLATA, PLATA_OSC, Shader.TileMode.CLAMP)
+    }
+
+    private fun drawSettingsButton(c: Canvas) {
+        p.style = Paint.Style.FILL
+        p.shader = settingsBg
+        c.drawRoundRect(settingsR, 14f, 14f, p)
+        p.shader = null
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = 3f
+        p.color = PLATA_OSC
+        c.drawRoundRect(settingsR, 14f, 14f, p)
+        p.style = Paint.Style.FILL
+        p.shader = gearShader
+        c.drawPath(gearPath, p)
+        p.shader = null
+        // aro de acento alrededor del agujero
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = 4f
+        p.color = NARANJA
+        c.drawCircle(settingsR.centerX(), settingsR.centerY(), settingsR.height() * 0.38f * 0.52f, p)
+    }
+
+    /** Tira de luces como la de un volante GT3: se enciende con el acelerador. */
+    private fun drawLeds(c: Canvas) {
+        val n = 15
+        val cw = ledR.width() / n
+        val rad = min(cw, ledR.height()) * 0.36f
+        // con datos del juego: sigue las revoluciones (desde el 70 %) y parpadea en el corte; sin datos: sigue el acelerador
+        val lit: Int = if (telemetryOn) {
+            val f = ((tRpm.toFloat() / tMaxRpm) - 0.70f) / 0.30f
+            if (tRpm >= tMaxRpm * 0.985f) {
+                if ((SystemClock.uptimeMillis() / 90) % 2L == 0L) n else 0
+            } else ceil(f.coerceIn(0f, 1f) * n).toInt()
+        } else ceil(gas * n).toInt()
+        p.style = Paint.Style.FILL
+        for (i in 0 until n) {
+            p.color = if (i < lit) {
+                if (i < 5) VERDE_GT else if (i < 10) ROJO_GT else AZUL_GT
+            } else 0xFF23272C.toInt()
+            c.drawCircle(ledR.left + cw * (i + 0.5f), ledR.centerY(), rad, p)
+        }
+    }
+
+    private fun gearLabel(): String = when (tGear) { 0 -> "R"; 1 -> "N"; else -> (tGear - 1).toString() }
+
+    private fun fmtTime(ms: Int): String {
+        if (ms <= 0 || ms > 3_600_000) return "--:--.---"
+        return String.format(Locale.US, "%d:%02d.%03d", ms / 60000, (ms % 60000) / 1000, ms % 1000)
+    }
+
+    /** Centro: marcha grande, diferencia con tu mejor vuelta, tiempos y barra de dirección. */
+    private fun drawCenter(c: Canvas) {
+        val on = telemetryOn
+        val x = cCx
+        p.style = Paint.Style.FILL
+        p.textAlign = Paint.Align.CENTER
+
+        // marcha
+        p.typeface = fontMono
+        p.color = if (on && tGear != 1) NARANJA else APAGADO
+        p.textSize = cH * 0.46f
+        c.drawText(if (on) gearLabel() else "–", x, cTop + cH * 0.40f, p)
+
+        // diferencia: rojo y "+" = más lento que tu mejor vuelta, verde y "−" = más rápido
+        val d = tDelta
+        p.textSize = cH * 0.13f
+        if (on && d != Int.MIN_VALUE) {
+            p.color = if (d > 0) ROJO_GT else VERDE_GT
+            c.drawText(String.format(Locale.US, "%s%.3f", if (d > 0) "+" else "−", abs(d) / 1000f), x, cTop + cH * 0.56f, p)
+        } else {
+            p.color = APAGADO
+            c.drawText("--.---", x, cTop + cH * 0.56f, p)
+        }
+
+        // tiempos
+        val cols = listOf("ACTUAL" to tCur, "ÚLTIMA" to tLast, "MEJOR" to tBest)
+        cols.forEachIndexed { i, (name, ms) ->
+            val cx = x + (i - 1) * cW * 0.33f
+            p.typeface = fontCond; p.color = PLATA_OSC; p.textSize = cH * 0.05f
+            c.drawText(name, cx, cTop + cH * 0.68f, p)
+            p.typeface = fontMono; p.color = if (on) BLANCO else APAGADO; p.textSize = cH * 0.08f
+            c.drawText(if (on) fmtTime(ms) else "--:--.---", cx, cTop + cH * 0.78f, p)
+        }
+
+        // barra de dirección
+        val half = cW * 0.4f
+        val by = cTop + cH * 0.90f
+        p.style = Paint.Style.STROKE
+        p.strokeCap = Paint.Cap.ROUND
+        p.strokeWidth = 8f
+        p.color = GRAFITO
+        c.drawLine(x - half, by, x + half, by, p)
+        p.strokeWidth = 4f
+        p.color = PLATA_OSC
+        c.drawLine(x, by - 14f, x, by + 14f, p)
+        p.style = Paint.Style.FILL
+        p.color = NARANJA
+        c.drawCircle(x + steer * half, by, 16f, p)
+        p.typeface = fontMono
+        p.color = PLATA
+        p.textSize = cH * 0.05f
+        c.drawText("${(steer * rangeDeg / 2f).roundToInt()}°", x, cTop + cH, p)
+    }
+
+    private fun drawPedalPanel(c: Canvas) {
+        val r = pedalR
+        val pw = r.width()
+        val cx = r.centerX()
+        p.style = Paint.Style.FILL
+        p.color = 0xFF0A0B0D.toInt()
+        c.drawRoundRect(r, 22f, 22f, p)
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = 4f
+        p.color = PLATA_OSC
+        c.drawRoundRect(r, 22f, 22f, p)
+
+        val gasV = gas
+        val brakeV = brake
+        val tag = pw * 0.075f
+        val pct = pw * 0.17f
+        p.style = Paint.Style.FILL
+        p.textAlign = Paint.Align.CENTER
+        p.typeface = fontCond; p.textSize = tag; p.color = PLATA
+        c.drawText("ACEL", cx, r.top + 16f + tag + 8f, p)
+        p.typeface = fontMono; p.textSize = pct
+        p.color = if (gasV > 0f) VERDE_GT else APAGADO
+        c.drawText("${(gasV * 100).roundToInt()}%", cx, r.top + 16f + tag + 8f + pct + 8f, p)
+        p.color = if (brakeV > 0f) ROJO_GT else APAGADO
+        c.drawText("${(brakeV * 100).roundToInt()}%", cx, r.bottom - 16f - tag - 22f, p)
+        p.typeface = fontCond; p.textSize = tag; p.color = PLATA
+        c.drawText("FRENO", cx, r.bottom - 16f, p)
+
+        drawBars(c, p, tmp, cx, trackCy, halfLen, pw * 0.34f, gasV, brakeV)
+        val sc = Cfg.knobScale / 100f
+        drawKnob(c, p, tmp, cx, trackCy - pedal * halfLen, min(pw * 0.8f * sc, pw * 0.94f), knobH * sc)
+    }
+
+    private fun button(c: Canvas, r: RectF, label: String, pressed: Boolean, textSize: Float, accent: Int) {
+        p.style = Paint.Style.FILL
+        p.color = if (pressed) accent else GRAFITO_OSC
+        c.drawRoundRect(r, 14f, 14f, p)
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = 4f
+        p.color = accent
+        c.drawRoundRect(r, 14f, 14f, p)
+        p.style = Paint.Style.FILL
+        p.typeface = fontCond
+        p.color = if (pressed) CARBON else BLANCO
+        p.textAlign = Paint.Align.CENTER
+        p.textSize = textSize
+        while (p.measureText(label) > r.width() - 14f && p.textSize > 12f) p.textSize -= 1f
+        c.drawText(label, r.centerX(), r.centerY() + p.textSize / 3f, p)
+    }
+
+    override fun onTouchEvent(e: MotionEvent): Boolean {
+        val act = e.actionMasked
+        if (act == MotionEvent.ACTION_CANCEL) {
+            pedalId = -1; pedal = 0f; up = false; down = false; handbrake = false; clutch = false
+            invalidate()
+            return true
+        }
+        val lifting = if (act == MotionEvent.ACTION_UP || act == MotionEvent.ACTION_POINTER_UP) e.actionIndex else -1
+        if (act == MotionEvent.ACTION_DOWN || act == MotionEvent.ACTION_POINTER_DOWN) {
+            val i = e.actionIndex
+            val x = e.getX(i); val y = e.getY(i)
+            when {
+                pedalR.contains(x, y) -> pedalId = e.getPointerId(i)
+                calR.contains(x, y) -> onCenter()
+                settingsR.contains(x, y) -> onSettings()
+            }
+        }
+        if (lifting >= 0 && e.getPointerId(lifting) == pedalId) pedalId = -1
+
+        var v = 0f; var u = false; var d = false; var hb = false; var cl = false
+        for (i in 0 until e.pointerCount) {
+            if (i == lifting) continue
+            val x = e.getX(i); val y = e.getY(i)
+            if (e.getPointerId(i) == pedalId) {
+                v = ((trackCy - y) / halfLen).coerceIn(-1f, 1f)   // arriba acelera, abajo frena
+            } else if (upR.contains(x, y)) {
+                u = true
+            } else if (downR.contains(x, y)) {
+                d = true
+            } else if (Cfg.drift && handR.contains(x, y)) {
+                hb = true
+            } else if (Cfg.drift && clutchR.contains(x, y)) {
+                cl = true
+            }
+        }
+        // vibración fuerte al pasar de acelerador a freno (o al revés) en un mismo gesto
+        val side = if (v > 0.1f) 1 else if (v < -0.1f) -1 else lastSide
+        if (pedalId == -1) {
+            lastSide = 0
+        } else {
+            if (lastSide != 0 && side != lastSide) onHaptic(3)
+            lastSide = side
+        }
+        if (u && !up) onHaptic(1)          // clic al cambiar de marcha
+        if (d && !down) onHaptic(1)
+        val step = (v * 10f).toInt()
+        if (pedalId != -1 && step != lastStep && abs(step) >= 10) onHaptic(2)   // golpe al llegar al tope
+        lastStep = step
+        pedal = v; up = u; down = d; handbrake = hb; clutch = cl   // al soltar, la palanca vuelve al centro
+        if (pedalId != -1 && v != 0f) onPedal()
+        invalidate()
+        return true
+    }
+}

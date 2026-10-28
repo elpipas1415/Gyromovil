@@ -1,0 +1,31 @@
+Gyromovil 1.13
+==============
+
+App Android : 1.13  (Gyromovil-v1.13.apk)
+Servidor PC : 1.13  (lo muestra al arrancar)
+Fecha       : 27/10/2026
+
+Si el servidor no pone "versión 1.13 del PC" al arrancar, esa carpeta
+pc es de una versión anterior.
+
+Cambios de esta versión
+-----------------------
+- Curbs y baches MUCHO más agresivos: umbrales más bajos en el PC, curva
+  que hace que un golpe mediano ya se sienta casi a fondo, golpe de 80 ms
+  y un "mazazo" de 110 ms a tope en los golpes grandes.
+- Slider "Baches y curbs" ahora llega al 300 % y parte de 150 %.
+- NUEVO: aviso antes de perder agarre. Tics cortos que se aceleran
+  (190 ms -> 60 ms entre tics) cuando el coche se acerca al límite; si el
+  agarre se pierde de verdad, pasa al zumbido continuo de siempre.
+  Slider "Aviso antes de perder agarre" en Ajustes -> Vibración.
+- Protocolo: el paquete de telemetría lleva un campo más (limite). Las apps
+  antiguas lo ignoran.
+- Pruebas nuevas del aviso de límite y de los curbs medianos.
+
+Historial
+---------
+1.08   tiempos desde texto, delta sin exigir vuelta válida, APK 1.08
+1.08.1 delta propio por posición
+1.08.2 referencia validada y protección contra saltos de posición
+1.12   carpeta de entrega ordenada (contenido de la 1.08.2)
+1.13   FFB agresivo en curbs + aviso de límite de agarre
